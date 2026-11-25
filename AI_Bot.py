@@ -1,5 +1,6 @@
 import streamlit as st
-import ollama
+import gemini_client
+import hashlib
 import numpy as np
 from pathlib import Path
 from rank_bm25 import BM25Okapi
@@ -200,8 +201,11 @@ KNOWLEDGE_FILE = (
     BASE_DIR / "data" / "anand_wealth_website_knowledge_base.txt"
 )
 
-EMBED_MODEL = "nomic-embed-text"
-LLM_MODEL = "qwen2.5:7b"
+EMBED_MODEL = gemini_client.EMBED_MODEL
+LLM_MODEL = gemini_client.LLM_MODEL
+
+# Embeddings are computed once locally and committed, so the cloud app never has to re-embed.
+CACHE_FILE = BASE_DIR / "data" / "embeddings_cache.npz"
 
 RERANKER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 
@@ -308,12 +312,7 @@ def bm25_search(question, bm25, chunks, top_k=5):
 def search_chunks(question, top_k=5):
 
     # Generate question embedding
-    result = ollama.embed(
-        model=EMBED_MODEL,
-        input=question
-    )
-
-    query_vector = np.array(result["embeddings"][0])
+    query_vector = gemini_client.embed([question], "RETRIEVAL_QUERY")[0]
 
     # Calculate cosine similarity
     scores = np.dot(
@@ -614,12 +613,11 @@ LATEST QUESTION: {question}
 STANDALONE QUESTION:"""
 
     try:
-        response = ollama.chat(
-            model=LLM_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            options={"temperature": 0, "num_predict": 80},
-        )
-        rewritten = response.message.content.strip().strip('"').strip("'")
+        rewritten = gemini_client.chat(
+            [{"role": "user", "content": prompt}],
+            temperature=0,
+            max_tokens=80,
+        ).strip('"').strip("'")
     except Exception as e:
         print("Rewrite error:", e)
         return question
@@ -678,13 +676,11 @@ QUESTION:
 LABEL:
 """
 
-    response = ollama.chat(
-        model=LLM_MODEL,
-        messages=[{"role": "user", "content": prompt}],
-        options={"temperature": 0, "num_predict": 20}
-    )
-
-    result = response.message.content.strip().upper()
+    result = gemini_client.chat(
+        [{"role": "user", "content": prompt}],
+        temperature=0,
+        max_tokens=20,
+    ).upper()
     # Check the longer/more specific labels first.
     if "NOT_ANSWERABLE" in result:
         return "NOT_ANSWERABLE"
@@ -703,17 +699,20 @@ def generate_embeddings(chunks):
 
     texts = [chunk["text"] for chunk in chunks]
 
-    result = ollama.embed(
-        model=EMBED_MODEL,
-        input=texts
-    )
-
-    return np.array(result["embeddings"])
+    return gemini_client.embed(texts, "RETRIEVAL_DOCUMENT")
 
 
 # --------------------------------
 # FUNCTION 4: PROCESS KNOWLEDGE BASE
 # --------------------------------
+
+def _chunks_fingerprint(chunks):
+    h = hashlib.sha256(EMBED_MODEL.encode("utf-8"))
+    for chunk in chunks:
+        h.update(chunk["text"].encode("utf-8"))
+        h.update(b"\x00")
+    return h.hexdigest()
+
 
 @st.cache_resource
 def process_knowledge(file_path, modified_time):
@@ -726,9 +725,30 @@ def process_knowledge(file_path, modified_time):
 
     chunks = split_text(text)
 
-    # Generate embeddings
+    # Use the pre-computed embeddings if they match these exact chunks
+    fingerprint = _chunks_fingerprint(chunks)
+
+    if CACHE_FILE.exists():
+        try:
+            cached = np.load(CACHE_FILE, allow_pickle=False)
+            if str(cached["fingerprint"]) == fingerprint:
+                return chunks, cached["embeddings"]
+            print("Embedding cache is outdated; re-embedding.")
+        except Exception as e:
+            print("Could not read embedding cache:", e)
+
+    # Generate embeddings (run locally once, then commit data/embeddings_cache.npz)
 
     embeddings = generate_embeddings(chunks)
+
+    try:
+        np.savez_compressed(
+            CACHE_FILE,
+            embeddings=embeddings,
+            fingerprint=np.array(fingerprint),
+        )
+    except Exception as e:
+        print("Could not save embedding cache:", e)
 
     return chunks, embeddings
 
@@ -956,19 +976,14 @@ if question:
 
                 with st.spinner("Anand Wealth AI is thinking..."):
                     try:
-                        response = ollama.chat(
-                            model=LLM_MODEL,
-                            messages=chat_messages,
-                            options={
-                                "temperature": 0.3,
-                                "num_ctx": 4096,
-                                "num_predict": 500
-                            }
+                        raw_answer = gemini_client.chat(
+                            chat_messages,
+                            temperature=0.3,
+                            max_tokens=500,
                         )
-                        print("Done reason:", response.done_reason)
-                        print("Generated response:", response.message.content)
-                    
-                        answer = remove_advice_offers(to_first_person(response.message.content.strip()))
+                        print("Generated response:", raw_answer)
+
+                        answer = remove_advice_offers(to_first_person(raw_answer))
 
                         # Remove accidental quotation marks around the full answer.
                         if (answer.startswith('"') and answer.endswith('"')) or (
